@@ -1,0 +1,106 @@
+# Nome do workflow - identificação visual no GitHub Actions
+name: "Terraform Workflow"
+
+# Define quando o workflow é executado
+# workflow_call: permite que este workflow seja chamado por outros workflows (reutilizável)
+on:
+  workflow_call:
+    # Parâmetros de entrada obrigatórios que devem ser passados quando o workflow é chamado
+    inputs:
+      # Ambiente de destino (dev, prod, etc.)
+      environment:
+        type: string
+        required: true
+      # ARN da role do AWS IAM para autenticação via OIDC
+      aws-assume-role-arn:
+        type: string
+        required: true
+      # Região da AWS onde os recursos serão criados
+      aws-region:
+        type: string
+        required: true
+      # Bucket S3 para armazenar o arquivo de estado do Terraform
+      aws-statefile-s3-bucket:
+        type: string
+        required: true
+      # Tabela DynamoDB para lock do estado (evita execuções simultâneas)
+      aws-lock-dynamodb-table:
+        type: string
+        required: true
+
+jobs:
+  terraform:
+    # Runner onde o job será executado (Ubuntu mais recente)
+    runs-on: ubuntu-latest
+    # Configuração padrão para todos os steps do job
+    defaults:
+      run:
+        shell: bash # Usa bash como shell padrão
+
+    steps:
+      # Step 1: Baixa o código do repositório para o runner
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Step 2: Instala o Terraform no runner
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.8.3 # Versão específica do Terraform
+
+      # Step 3: Configura as credenciais da AWS usando OIDC (sem precisar de access keys)
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ inputs.aws-assume-role-arn }}
+          role-session-name: GitHub_to_AWS_via_FederatedOIDC
+          aws-region: ${{ inputs.aws-region }}
+
+      # Step 4: Lê configuração de destroy de um arquivo JSON
+      # Permite controlar se deve executar destroy ou apply baseado no ambiente
+      - name: Read destroy configuration
+        id: read-destroy-config
+        run: |
+          DESTROY="$(jq -r '.${{ inputs.environment }}' ./infra/destroy_config.json)"
+          echo "destroy=$(echo $DESTROY)" >> $GITHUB_OUTPUT
+
+      # Step 5: Inicializa o Terraform com configuração do backend remoto
+      # Backend remoto: estado armazenado no S3 com lock no DynamoDB
+      - name: Terraform Init
+        run: |
+          cd infra && terraform init \
+            -backend-config="bucket=${{ inputs.aws-statefile-s3-bucket }}" \
+            -backend-config="key=${{ github.event.repository.name }}" \
+            -backend-config="region=${{ inputs.aws-region }}" \
+            -backend-config="dynamodb_table=${{ inputs.aws-lock-dynamodb-table }}"
+
+      # Step 6: Valida a sintaxe e configuração dos arquivos Terraform
+      - name: Terraform Validate
+        run: terraform validate
+
+      # Step 7: CONDICIONAL - Executa destroy apenas se configurado como 'true'
+      # Destrói toda a infraestrutura do ambiente específico
+      - name: Terraform Destroy
+        if: steps.read-destroy-config.outputs.destroy == 'true'
+        id: terraform-destroy
+        run: cd infra &&
+          terraform workspace select ${{ inputs.environment }} || terraform workspace new ${{ inputs.environment }} &&
+          terraform destroy -var-file="./envs/${{ inputs.environment }}/terraform.tfvars" -auto-approve
+
+      # Step 8: CONDICIONAL - Cria plano de execução (apenas se não for destroy)
+      # Mostra o que será criado/modificado sem aplicar mudanças
+      - name: Terraform Plan
+        if: steps.read-destroy-config.outputs.destroy != 'true'
+        id: terraform-plan
+        run: cd infra &&
+          terraform workspace select ${{ inputs.environment }} || terraform workspace new ${{ inputs.environment }} &&
+          terraform plan -var-file="./envs/${{ inputs.environment }}/terraform.tfvars" -out="${{ inputs.environment }}.plan"
+
+      # Step 9: CONDICIONAL - Aplica as mudanças (apenas se não for destroy)
+      # Executa o plano criado no step anterior, criando/modificando recursos
+      - name: Terraform Apply
+        if: steps.read-destroy-config.outputs.destroy != 'true'
+        id: terraform-apply
+        run: cd infra &&
+          terraform workspace select ${{ inputs.environment }} || terraform workspace new ${{ inputs.environment }} &&
+          terraform apply "${{ inputs.environment }}.plan"

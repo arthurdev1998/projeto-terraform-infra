@@ -1,0 +1,1 @@
+bucket_name = "dev-sa-east-1-arthur-pipeline-123"
