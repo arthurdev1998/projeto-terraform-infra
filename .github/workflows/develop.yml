@@ -15,6 +15,6 @@ jobs:
     with:
       environment: "dev"
       aws-assume-role-arn: "arn:aws:iam::993125448362:role/github-action-arthur-pipeline"
-      aws-region: "sa-east-1"
+      aws-region: "us-east-1"
       aws-statefile-s3-bucket: "arthurdev1998-sa-east-1-terraform"
       aws-lock-dynamodb-table: "arthurdev1998-sa-east-1-terraform"
